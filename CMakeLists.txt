@@ -56,6 +56,9 @@ target_compile_definitions(ble_temp_server PRIVATE
 )
 pico_btstack_make_gatt_header(ble_temp_server PRIVATE "${CMAKE_CURRENT_LIST_DIR}/temp_sensor.gatt")
 
+pico_enable_stdio_usb(ble_temp_server 1)
+pico_enable_stdio_uart(ble_temp_server 1)
+
 pico_add_extra_outputs(ble_temp_server)
 
 # Example that connects to ble_temp_server and reads the temperature

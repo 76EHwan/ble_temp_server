@@ -13,6 +13,7 @@
 #include "pico/btstack_cyw43.h"
 #include "hardware/pwm.h"
 #include "pico/stdlib.h"
+#include "pico/bootrom.h"
 
 #include "temp_sensor.h"
 
@@ -53,9 +54,15 @@ static uint pwm_channel;
 
 static hci_con_handle_t con_handle = HCI_CON_HANDLE_INVALID;
 static btstack_timer_source_t heartbeat;
+static btstack_timer_source_t led_pwm_timer;
+static bool led_pwm_timer_active = false;
+static bool led_pwm_is_on = false;
 static btstack_packet_callback_registration_t hci_event_callback_registration;
 
-extern uint8_t const profile_data[];
+#define SOFT_PWM_PERIOD_MS 20  // 50Hz 주기 (부드러운 조절 및 통신 안정성 유지)
+
+static void set_pwm_duty(uint8_t duty);
+static void set_led_state(uint8_t state);
 
 // =========================================================================
 // PWM 및 LED 제어 함수
@@ -66,7 +73,7 @@ static void init_pwm(void) {
     pwm_channel = pwm_gpio_to_channel(PWM_GPIO_PIN);
 
     // RP2350 클럭 기준 150MHz / 150 = 1MHz 클럭 카운터
-    // wrap = 255 -> 약 3.9kHz 주파수 (LED 깜빡임 없이 부드러운 밝기 제어)
+    // wrap = 255 -> 약 3.9kHz 주파수
     pwm_config config = pwm_get_default_config();
     pwm_config_set_clkdiv(&config, 150.0f);
     pwm_config_set_wrap(&config, PWM_WRAP);
@@ -74,19 +81,75 @@ static void init_pwm(void) {
 
     // 초기 듀티비 0 (OFF)
     pwm_set_chan_level(pwm_slice_num, pwm_channel, 0);
-    printf("[INIT] PWM initialized on GPIO %d (Slice %u, Channel %u, Freq ~3.9kHz)\n", 
-           PWM_GPIO_PIN, pwm_slice_num, pwm_channel);
+    printf("[INIT] Hardware PWM initialized on GPIO %d (Freq ~3.9kHz)\n", PWM_GPIO_PIN);
+}
+
+// 내장 LED 소프트웨어 PWM 타이머 핸들러
+static void led_pwm_timer_handler(struct btstack_timer_source *ts) {
+    if (pwm_duty == 0 || pwm_duty == 255) {
+        led_pwm_timer_active = false;
+        return;
+    }
+
+    uint32_t on_ms = ((uint32_t)pwm_duty * SOFT_PWM_PERIOD_MS) / 255;
+    if (on_ms == 0) on_ms = 1;
+    if (on_ms >= SOFT_PWM_PERIOD_MS) on_ms = SOFT_PWM_PERIOD_MS - 1;
+    uint32_t off_ms = SOFT_PWM_PERIOD_MS - on_ms;
+
+    if (led_pwm_is_on) {
+        cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 0);
+        led_pwm_is_on = false;
+        btstack_run_loop_set_timer(ts, off_ms);
+    } else {
+        cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
+        led_pwm_is_on = true;
+        btstack_run_loop_set_timer(ts, on_ms);
+    }
+    btstack_run_loop_add_timer(ts);
 }
 
 static void set_pwm_duty(uint8_t duty) {
     pwm_duty = duty;
+    led_state = (duty > 0) ? 1 : 0;
+
+    // 외부 PWM 핀(GPIO 15)에도 하드웨어 PWM 동시 반영
     pwm_set_chan_level(pwm_slice_num, pwm_channel, duty);
+
+    // 기존 내장 LED 소프트웨어 PWM 타이머 정리
+    if (led_pwm_timer_active) {
+        btstack_run_loop_remove_timer(&led_pwm_timer);
+        led_pwm_timer_active = false;
+    }
+
+    if (pwm_duty == 0) {
+        cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 0);
+        led_pwm_is_on = false;
+    } else if (pwm_duty == 255) {
+        cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
+        led_pwm_is_on = true;
+    } else {
+        // 1 ~ 254: 소프트웨어 PWM 동작 시작
+        uint32_t on_ms = ((uint32_t)pwm_duty * SOFT_PWM_PERIOD_MS) / 255;
+        if (on_ms == 0) on_ms = 1;
+        if (on_ms >= SOFT_PWM_PERIOD_MS) on_ms = SOFT_PWM_PERIOD_MS - 1;
+
+        cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
+        led_pwm_is_on = true;
+
+        led_pwm_timer.process = &led_pwm_timer_handler;
+        btstack_run_loop_set_timer(&led_pwm_timer, on_ms);
+        btstack_run_loop_add_timer(&led_pwm_timer);
+        led_pwm_timer_active = true;
+    }
 }
 
 static void set_led_state(uint8_t state) {
-    led_state = state ? 1 : 0;
-    // Pico 2 W의 온보드 LED는 CYW43 무선 칩을 통해 제어
-    cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, led_state);
+    // ff11에서 00이면 duty 0 (OFF), 01(또는 0이 아닌 값)이면 duty 255 (100% ON)
+    if (state == 0) {
+        set_pwm_duty(0);
+    } else {
+        set_pwm_duty(255);
+    }
 }
 
 // =========================================================================
@@ -118,9 +181,15 @@ static void packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packe
             printf("BLE Advertising started. Device Name: 'Pico2W-LED-PWM'\n");
             break;
 
-        case HCI_EVENT_CONNECTION_COMPLETE:
-            con_handle = hci_subevent_connection_complete_get_connection_handle(packet);
-            printf(">> BLE Client connected! (Handle: 0x%04x)\n", con_handle);
+        case HCI_EVENT_META_GAP:
+            switch (hci_event_gap_meta_get_subevent_code(packet)) {
+                case GAP_SUBEVENT_LE_CONNECTION_COMPLETE:
+                    con_handle = gap_subevent_le_connection_complete_get_connection_handle(packet);
+                    printf(">> BLE Client connected! (Handle: 0x%04x)\n", con_handle);
+                    break;
+                default:
+                    break;
+            }
             break;
 
         case HCI_EVENT_DISCONNECTION_COMPLETE:
@@ -160,11 +229,16 @@ static int att_write_callback(hci_con_handle_t connection_handle, uint16_t att_h
     UNUSED(offset);
     UNUSED(connection_handle);
 
-    // 온보드 LED 제어 (UUID 0xFF11): 1바이트 (0: OFF, 1: ON)
+    // 온보드 LED 제어 (UUID 0xFF11): 1바이트 (0: OFF, 1: ON, 0xBB: BOOTSEL 진입)
     if (att_handle == ATT_CHARACTERISTIC_FF11_01_VALUE_HANDLE) {
         if (buffer_size >= 1) {
+            if (buffer[0] == 0xBB) {
+                printf("[BLE COMMAND] 0xBB received -> Rebooting to USB BOOTSEL mode!\n");
+                sleep_ms(100);
+                reset_usb_boot(0, 0);
+            }
             set_led_state(buffer[0]);
-            printf("[BLE WRITE] On-board LED -> %s (%d)\n", led_state ? "ON" : "OFF", led_state);
+            printf("[BLE WRITE FF11] LED -> %s (Duty %u/255)\n", led_state ? "ON" : "OFF", pwm_duty);
         }
         return 0;
     }
@@ -173,8 +247,8 @@ static int att_write_callback(hci_con_handle_t connection_handle, uint16_t att_h
     if (att_handle == ATT_CHARACTERISTIC_FF12_01_VALUE_HANDLE) {
         if (buffer_size >= 1) {
             set_pwm_duty(buffer[0]);
-            printf("[BLE WRITE] PWM (GPIO %d) Duty -> %u / 255 (%.1f%%)\n",
-                   PWM_GPIO_PIN, pwm_duty, (pwm_duty * 100.0f) / 255.0f);
+            printf("[BLE WRITE FF12] LED Brightness -> Duty %u / 255 (%.1f%%)\n",
+                   pwm_duty, (pwm_duty * 100.0f) / 255.0f);
         }
         return 0;
     }
@@ -192,12 +266,16 @@ static void heartbeat_handler(struct btstack_timer_source *ts) {
     btstack_run_loop_add_timer(ts);
 }
 
-// 키보드 's' 입력으로 블루투스를 중지/재시작할 수 있는 기능 유지
+// 키보드 입력 콜백: 's'는 정지/재시작, 'b'는 BOOTSEL 모드 즉시 재부팅
 static volatile bool key_pressed;
 void key_pressed_func(void *param) {
     int key = getchar_timeout_us(0);
     if (key == 's' || key == 'S') {
         key_pressed = true;
+    } else if (key == 'b' || key == 'B') {
+        printf("\n>> [BOOTSEL] Rebooting into USB BOOTSEL mode for firmware upload...\n");
+        sleep_ms(100);
+        reset_usb_boot(0, 0);
     }
 }
 
@@ -222,10 +300,11 @@ restart:
 
     // 콘솔 안내
     printf("==========================================\n");
-    printf(" Pico 2 W BLE LED & PWM Server Started\n");
-    printf(" - On-board LED: Characteristic 0xFF11 (0 or 1)\n");
-    printf(" - PWM Pin GPIO %d: Characteristic 0xFF12 (0 ~ 255)\n", PWM_GPIO_PIN);
-    printf(" Press 'S' key on serial to Stop bluetooth\n");
+    printf(" Pico 2 W BLE LED PWM Server Started\n");
+    printf(" - FF11 : 00 -> Duty 0 (OFF), 01 -> Duty 255 (ON)\n");
+    printf(" - FF12 : 0 ~ 255 -> On-board LED Brightness (PWM)\n");
+    printf(" Press 'B' on serial: Reboot to BOOTSEL (No button needed!)\n");
+    printf(" Press 'S' on serial: Stop/Restart bluetooth\n");
     printf("==========================================\n");
     stdio_set_chars_available_callback(key_pressed_func, NULL);
 
@@ -259,6 +338,11 @@ restart:
     }
 
     // 블루투스 정리 및 종료
+    if (led_pwm_timer_active) {
+        btstack_run_loop_remove_timer(&led_pwm_timer);
+        led_pwm_timer_active = false;
+    }
+    cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 0);
     att_server_deinit();
     sm_deinit();
     l2cap_deinit();
